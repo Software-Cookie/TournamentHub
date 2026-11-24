@@ -1,0 +1,905 @@
+// TournamentHub database schema
+// Money is always stored as integer minor units (paise for INR).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Platform / multi-organisation (SaaS-ready)
+// ─────────────────────────────────────────────────────────────
+
+enum Role {
+  SUPER_ADMIN // platform owner
+  ADMIN // platform administrator
+  PLAYER
+}
+
+enum OrgRole {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+enum PlanTier {
+  INTERNAL
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+model Organisation {
+  id           String   @id @default(cuid())
+  name         String
+  slug         String   @unique
+  logoUrl      String?
+  brandColor   String?
+  contactEmail String?
+  contactPhone String?
+  city         String?
+  about        String?
+  plan         PlanTier @default(INTERNAL)
+  isActive     Boolean  @default(true)
+  // Payout details for settling registration fees collected on the organiser's behalf
+  payoutUpi       String?
+  payoutAccount   String? // free-text bank details (name / account / IFSC)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  members     OrganisationMember[]
+  organisers  Organiser[]
+  tournaments Tournament[]
+  venues      Venue[]
+  listingFees ListingFee[]
+  payouts     Payout[]
+}
+
+model OrganisationMember {
+  id             String       @id @default(cuid())
+  organisationId String
+  userId         String
+  role           OrgRole      @default(STAFF)
+  createdAt      DateTime     @default(now())
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organisationId, userId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Users & authentication
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  phone         String?
+  city          String?
+  role          Role      @default(PLAYER)
+  isDisabled    Boolean   @default(false)
+  // bumped on password change / logout-everywhere to invalidate JWTs
+  sessionVersion Int      @default(0)
+  lastLoginAt   DateTime?
+  isDemo        Boolean   @default(false)
+  // Premium membership: active while premiumUntil is in the future
+  premiumUntil  DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  authTokens    AuthToken[]
+  memberships   OrganisationMember[]
+  registrations Registration[]
+  payments      Payment[]
+  auditLogs     AuditLog[]
+  emailLogs     EmailLog[]
+  premiumMemberships PremiumMembership[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sports configuration
+// ─────────────────────────────────────────────────────────────
+
+enum ParticipantType {
+  INDIVIDUAL
+  TEAM
+}
+
+enum GenderRule {
+  OPEN
+  MALE
+  FEMALE
+  MIXED // team must contain at least one male and one female
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum BracketFormat {
+  SINGLE_ELIMINATION
+}
+
+model Sport {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  isActive    Boolean  @default(false)
+  icon        String?
+  // Fee an organiser pays the platform to list one tournament of this sport (paise, GST inclusive)
+  listingFee  Int      @default(49900)
+  // default categories, scoring hints, etc. (see src/lib/sports.ts)
+  config      Json     @default("{}")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+  tournaments Tournament[]
+  listingFees ListingFee[]
+}
+
+// ─────────────────────────────────────────────────────────────
+// Platform business: listing fees & organiser payouts
+// ─────────────────────────────────────────────────────────────
+
+enum ListingStatus {
+  UNPAID
+  PAID
+  WAIVED // platform-run tournaments or admin override
+}
+
+enum ListingFeeStatus {
+  CREATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+model ListingFee {
+  id                String           @id @default(cuid())
+  tournamentId      String
+  organisationId    String?
+  sportId           String
+  userId            String
+  amount            Int // paise, total charged = baseAmount + platformFee + gstAmount
+  baseAmount        Int              @default(0) // snapshot of Sport.listingFee
+  platformFee       Int              @default(0) // 2% platform charge
+  gstAmount         Int              @default(0) // 18% GST on base + platform charge
+  currency          String           @default("INR")
+  status            ListingFeeStatus @default(CREATED)
+  providerOrderId   String           @unique
+  providerPaymentId String?          @unique
+  method            String?
+  fee               Int?
+  tax               Int?
+  paidAt            DateTime?
+  verifiedVia       String?
+  failureReason     String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  tournament        Tournament       @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  organisation      Organisation?    @relation(fields: [organisationId], references: [id])
+  sport             Sport            @relation(fields: [sportId], references: [id])
+
+  @@index([tournamentId, status])
+  @@index([status, createdAt])
+}
+
+model Payout {
+  id             String       @id @default(cuid())
+  organisationId String
+  tournamentId   String?
+  amount         Int // paise
+  reference      String // UTR / transaction reference
+  note           String?
+  paidAt         DateTime     @default(now())
+  createdById    String?
+  createdAt      DateTime     @default(now())
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  @@index([organisationId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tournaments
+// ─────────────────────────────────────────────────────────────
+
+model Venue {
+  id             String        @id @default(cuid())
+  organisationId String?
+  name           String
+  addressLine    String
+  city           String
+  state          String?
+  postalCode     String?
+  country        String        @default("India")
+  mapUrl         String?
+  latitude       Float?
+  longitude      Float?
+  createdAt      DateTime      @default(now())
+  organisation   Organisation? @relation(fields: [organisationId], references: [id])
+  tournaments    Tournament[]
+}
+
+model Organiser {
+  id             String        @id @default(cuid())
+  organisationId String?
+  name           String
+  email          String
+  phone          String
+  logoUrl        String?
+  website        String?
+  createdAt      DateTime      @default(now())
+  organisation   Organisation? @relation(fields: [organisationId], references: [id])
+  tournaments    Tournament[]
+}
+
+enum TournamentStatus {
+  DRAFT
+  PUBLISHED
+  ONGOING
+  COMPLETED
+  CANCELLED
+  ARCHIVED
+}
+
+model Tournament {
+  id                   String           @id @default(cuid())
+  slug                 String           @unique
+  organisationId       String?
+  sportId              String
+  organiserId          String?
+  venueId              String?
+  name                 String
+  tagline              String?
+  description          String           @db.Text
+  bannerUrl            String?
+  status               TournamentStatus @default(DRAFT)
+  isFeatured           Boolean          @default(false)
+  startDate            DateTime
+  endDate              DateTime?
+  registrationOpensAt  DateTime
+  registrationClosesAt DateTime
+  matchStartTime       String? // e.g. "08:00"
+  reportingMinutesBefore Int            @default(15)
+  entryFee             Int              @default(0) // default per-category fee (paise)
+  currency             String           @default("INR")
+  maxParticipants      Int? // overall entries cap across categories
+  requiresApproval     Boolean          @default(false)
+  allowMultipleCategories Boolean       @default(true)
+  rules                String?          @db.Text
+  terms                String?          @db.Text
+  refundPolicy         String?          @db.Text
+  participantInstructions String?       @db.Text
+  customQuestions      Json             @default("[]")
+  reminderOffsetsHours Int[]            @default([24, 3])
+  emailSenderName      String?
+  emailReplyTo         String?
+  prizePoolValue       Int              @default(0) // denormalised sum of cash prizes (paise) for sorting
+  resultsAnnouncedAt   DateTime?
+  isDemo               Boolean          @default(false) // sample data — removable with `npm run demo:clear`
+  listingStatus        ListingStatus    @default(UNPAID)
+  listingPaidAt        DateTime?
+  createdById          String?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  listingFees          ListingFee[]
+
+  organisation  Organisation?        @relation(fields: [organisationId], references: [id])
+  sport         Sport                @relation(fields: [sportId], references: [id])
+  organiser     Organiser?           @relation(fields: [organiserId], references: [id])
+  venue         Venue?               @relation(fields: [venueId], references: [id])
+  categories    TournamentCategory[]
+  prizes        Prize[]
+  images        TournamentImage[]
+  sponsors      Sponsor[]
+  registrations Registration[]
+  payments      Payment[]
+  rounds        MatchRound[]
+  matches       Match[]
+  notifications Notification[]
+  emailLogs     EmailLog[]
+
+  @@index([status, startDate])
+  @@index([organisationId])
+}
+
+enum CategoryStatus {
+  OPEN
+  CLOSED
+  DRAWN // fixtures generated
+  IN_PROGRESS
+  COMPLETED
+}
+
+model TournamentCategory {
+  id              String          @id @default(cuid())
+  tournamentId    String
+  code            String // MS, WS, MD, WD, XD …
+  name            String
+  participantType ParticipantType @default(INDIVIDUAL)
+  teamSize        Int             @default(1) // maximum players per entry
+  minTeamSize     Int? // minimum roster size for team sports (defaults to teamSize)
+  genderRule      GenderRule      @default(OPEN)
+  entryFee        Int? // overrides tournament fee when set (paise)
+  maxEntries      Int?
+  minAge          Int?
+  maxAge          Int?
+  format          BracketFormat   @default(SINGLE_ELIMINATION)
+  thirdPlacePlayoff Boolean       @default(false)
+  status          CategoryStatus  @default(OPEN)
+  sortOrder       Int             @default(0)
+  championId      String? // registration id of the winner
+  createdAt       DateTime        @default(now())
+
+  tournament    Tournament     @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  registrations Registration[]
+  rounds        MatchRound[]
+  matches       Match[]
+  prizes        Prize[]
+  teams         Team[]
+
+  @@unique([tournamentId, code])
+}
+
+enum PrizeType {
+  CASH
+  TROPHY
+  RACKET
+  SPORTS_KIT
+  MEDAL
+  GIFT_VOUCHER
+  CUSTOM
+}
+
+model Prize {
+  id           String              @id @default(cuid())
+  tournamentId String
+  categoryId   String?
+  type         PrizeType
+  position     Int // 1, 2, 3 …
+  title        String
+  description  String?
+  imageUrl     String?
+  quantity     Int                 @default(1)
+  cashValue    Int? // paise
+  createdAt    DateTime            @default(now())
+  tournament   Tournament          @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  category     TournamentCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([tournamentId])
+}
+
+enum ImageKind {
+  BANNER
+  COURT
+  VENUE
+  ORGANISER_LOGO
+  SPONSOR
+  PRIZE
+  GALLERY
+}
+
+model TournamentImage {
+  id           String     @id @default(cuid())
+  tournamentId String
+  kind         ImageKind
+  url          String
+  publicId     String?
+  alt          String?
+  width        Int?
+  height       Int?
+  sortOrder    Int        @default(0)
+  createdAt    DateTime   @default(now())
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  @@index([tournamentId, kind])
+}
+
+model Sponsor {
+  id           String     @id @default(cuid())
+  tournamentId String
+  name         String
+  logoUrl      String?
+  website      String?
+  tier         String?
+  sortOrder    Int        @default(0)
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Registrations, teams, participants
+// ─────────────────────────────────────────────────────────────
+
+enum RegistrationStatus {
+  PENDING_PAYMENT
+  PENDING_APPROVAL
+  CONFIRMED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+model Registration {
+  id              String             @id @default(cuid())
+  code            String             @unique // human readable, e.g. TH-MD-7K2Q9X
+  tournamentId    String
+  categoryId      String
+  userId          String
+  teamId          String?            @unique
+  status          RegistrationStatus @default(PENDING_PAYMENT)
+  amount          Int // paise, snapshot at time of registration
+  currency        String             @default("INR")
+  answers         Json               @default("{}")
+  termsAcceptedAt DateTime
+  seed            Int?
+  // Set to "<categoryId>:<userId>" while the registration is active; cleared on cancel/expire.
+  // A unique index here enforces "one active entry per user per category" at DB level.
+  activeKey       String?            @unique
+  adminNote       String?
+  confirmedAt     DateTime?
+  cancelledAt     DateTime?
+  expiresAt       DateTime? // pending-payment hold expiry
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  tournament   Tournament         @relation(fields: [tournamentId], references: [id])
+  category     TournamentCategory @relation(fields: [categoryId], references: [id])
+  user         User               @relation(fields: [userId], references: [id])
+  team         Team?              @relation(fields: [teamId], references: [id])
+  participants Participant[]
+  payments     Payment[]
+  ticket       Ticket?
+  matchesAsA   Match[]            @relation("EntryA")
+  matchesAsB   Match[]            @relation("EntryB")
+  matchesWon   Match[]            @relation("Winner")
+
+  @@index([tournamentId, categoryId, status])
+  @@index([userId])
+}
+
+model Team {
+  id           String             @id @default(cuid())
+  tournamentId String
+  categoryId   String
+  name         String
+  captainName  String
+  captainEmail String
+  captainPhone String
+  // "<categoryId>:<normalised team name>" while active — prevents duplicate team names in a category
+  activeKey    String?            @unique
+  createdAt    DateTime           @default(now())
+  category     TournamentCategory @relation(fields: [categoryId], references: [id])
+  registration Registration?
+  members      TeamMember[]
+
+  @@index([tournamentId])
+}
+
+model Participant {
+  id                    String       @id @default(cuid())
+  registrationId        String
+  tournamentId          String
+  categoryId            String
+  fullName              String
+  // Contact details are required for the registrant / captain and for singles & doubles players;
+  // optional for additional squad members in larger team sports.
+  email                 String?
+  phone                 String?
+  dateOfBirth           DateTime?
+  gender                Gender?
+  city                  String?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  skillLevel            String?
+  // "<categoryId>:<lower(email)>" while active — prevents the same player entering a category twice
+  activeKey             String?      @unique
+  createdAt             DateTime     @default(now())
+  registration          Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  teamMember            TeamMember?
+
+  @@index([tournamentId, email])
+}
+
+enum TeamRole {
+  CAPTAIN
+  PLAYER
+}
+
+model TeamMember {
+  id            String      @id @default(cuid())
+  teamId        String
+  participantId String      @unique
+  slot          Int // 1, 2 …
+  role          TeamRole    @default(PLAYER)
+  team          Team        @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, slot])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Payments
+// ─────────────────────────────────────────────────────────────
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  PAID
+  FAILED
+  REFUND_PENDING
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  registrationId    String
+  tournamentId      String
+  userId            String
+  provider          String        @default("razorpay")
+  providerOrderId   String        @unique
+  providerPaymentId String?       @unique
+  providerSignature String?
+  amount            Int // paise
+  currency          String        @default("INR")
+  status            PaymentStatus @default(CREATED)
+  method            String?
+  fee               Int? // gateway fee (paise) incl. tax, from Razorpay
+  tax               Int?
+  refundedAmount    Int           @default(0)
+  failureReason     String?
+  paidAt            DateTime?
+  verifiedVia       String? // "checkout" | "webhook" | "reconcile"
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  registration      Registration  @relation(fields: [registrationId], references: [id])
+  tournament        Tournament    @relation(fields: [tournamentId], references: [id])
+  user              User          @relation(fields: [userId], references: [id])
+  refunds           Refund[]
+
+  @@index([tournamentId, status])
+  @@index([registrationId])
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+model Refund {
+  id               String       @id @default(cuid())
+  paymentId        String
+  providerRefundId String?      @unique
+  amount           Int
+  status           RefundStatus @default(PENDING)
+  reason           String?
+  initiatedById    String?
+  processedAt      DateTime?
+  createdAt        DateTime     @default(now())
+  payment          Payment      @relation(fields: [paymentId], references: [id])
+}
+
+model WebhookEvent {
+  id          String   @id // provider event id (x-razorpay-event-id)
+  provider    String
+  type        String
+  payload     Json
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tickets
+// ─────────────────────────────────────────────────────────────
+
+model Ticket {
+  id             String       @id @default(cuid())
+  registrationId String       @unique
+  number         String       @unique // printed on the ticket
+  qrToken        String       @unique // random secret encoded in the QR
+  issuedAt       DateTime     @default(now())
+  checkedInAt    DateTime?
+  checkedInById  String?
+  revokedAt      DateTime?
+  registration   Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fixtures & matches
+// ─────────────────────────────────────────────────────────────
+
+enum RoundStatus {
+  PENDING
+  ACTIVE
+  COMPLETED
+}
+
+model MatchRound {
+  id           String             @id @default(cuid())
+  tournamentId String
+  categoryId   String
+  number       Int // 1 = first round
+  name         String // "Round of 16", "Quarter-finals", "Final", "Third-place playoff"
+  isThirdPlace Boolean            @default(false)
+  status       RoundStatus        @default(PENDING)
+  createdAt    DateTime           @default(now())
+  tournament   Tournament         @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  category     TournamentCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  matches      Match[]
+
+  @@unique([categoryId, number, isThirdPlace])
+}
+
+enum MatchStatus {
+  SCHEDULED
+  UPCOMING
+  READY
+  ONGOING
+  COMPLETED
+  POSTPONED
+  CANCELLED
+}
+
+model Match {
+  id            String             @id @default(cuid())
+  tournamentId  String
+  categoryId    String
+  roundId       String
+  position      Int // 0-based index within round
+  entryAId      String?
+  entryBId      String?
+  winnerId      String?
+  isBye         Boolean            @default(false)
+  status        MatchStatus        @default(SCHEDULED)
+  court         String?
+  scheduledAt   DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  liveScore     String?
+  notes         String?
+  nextMatchId   String?
+  nextSlot      String? // "A" | "B"
+  loserNextMatchId String? // third-place playoff feed
+  loserNextSlot String?
+  version       Int                @default(0) // optimistic concurrency
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  tournament Tournament         @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  category   TournamentCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  round      MatchRound         @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  entryA     Registration?      @relation("EntryA", fields: [entryAId], references: [id])
+  entryB     Registration?      @relation("EntryB", fields: [entryBId], references: [id])
+  winner     Registration?      @relation("Winner", fields: [winnerId], references: [id])
+  result     MatchResult?
+  history    MatchHistory[]
+
+  @@unique([roundId, position])
+  @@index([tournamentId, status])
+  @@index([entryAId])
+  @@index([entryBId])
+}
+
+model MatchResult {
+  id              String   @id @default(cuid())
+  matchId         String   @unique
+  winnerId        String
+  score           String // "21-18, 19-21, 21-15"
+  durationMinutes Int?
+  remarks         String?
+  recordedById    String?
+  recordedAt      DateTime @default(now())
+  match           Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+}
+
+model MatchHistory {
+  id        String   @id @default(cuid())
+  matchId   String
+  action    String
+  before    Json?
+  after     Json?
+  actorId   String?
+  createdAt DateTime @default(now())
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@index([matchId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Notifications, email, audit
+// ─────────────────────────────────────────────────────────────
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+enum NotificationAudience {
+  ALL
+  CATEGORY
+  TEAM
+  SELECTED
+}
+
+model Notification {
+  id             String               @id @default(cuid())
+  tournamentId   String
+  channel        NotificationChannel  @default(EMAIL)
+  audience       NotificationAudience
+  audienceFilter Json                 @default("{}")
+  subject        String
+  body           String               @db.Text
+  recipientCount Int                  @default(0)
+  sentCount      Int                  @default(0)
+  failedCount    Int                  @default(0)
+  createdById    String?
+  createdAt      DateTime             @default(now())
+  tournament     Tournament           @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  emailLogs      EmailLog[]
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model EmailLog {
+  id             String        @id @default(cuid())
+  // unique key per logical email, e.g. "reminder:24:<registrationId>" — prevents duplicate sends
+  dedupeKey      String        @unique
+  template       String
+  to             String
+  subject        String
+  status         EmailStatus   @default(QUEUED)
+  providerId     String?
+  error          String?
+  attempts       Int           @default(0)
+  payload        Json? // data needed to re-render on retry
+  userId         String?
+  tournamentId   String?
+  notificationId String?
+  sentAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  user           User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  tournament     Tournament?   @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+  notification   Notification? @relation(fields: [notificationId], references: [id], onDelete: SetNull)
+
+  @@index([status, attempts])
+  @@index([tournamentId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model RateLimit {
+  key         String   @id
+  count       Int
+  windowStart DateTime
+}
+
+model SiteSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+enum PremiumPlan {
+  MONTHLY
+  YEARLY
+}
+
+enum MembershipStatus {
+  CREATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+/// One purchase of a premium membership period (₹59/month or yearly at 10% off).
+model PremiumMembership {
+  id                String           @id @default(cuid())
+  userId            String
+  plan              PremiumPlan
+  amount            Int // paise
+  currency          String           @default("INR")
+  status            MembershipStatus @default(CREATED)
+  providerOrderId   String           @unique
+  providerPaymentId String?          @unique
+  method            String?
+  fee               Int?
+  tax               Int?
+  startsAt          DateTime?
+  endsAt            DateTime?
+  paidAt            DateTime?
+  verifiedVia       String?
+  failureReason     String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+}
